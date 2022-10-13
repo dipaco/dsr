@@ -73,6 +73,30 @@ class PybulletSim:
                 frictionAnchor=True
             )
 
+        # Set default camera views
+        np.random.seed(25654)  # Set the seed to a random number I just thought of
+        base_cam_dist = np.linalg.norm(np.array([0.5, -0.7, 0.3]))
+
+        ## For fully random cameras
+        #cam_bounds = np.array([
+        #    [np.cos(-3 * np.pi / 4), np.cos(0)],
+        #    [np.sin(0), np.sin(-np.pi / 2)],
+        #    [np.sin(np.pi / 10), np.sin(np.pi / 4)]
+        #])
+
+        ## For only elevation cameras
+        cam_bounds = np.array([
+            [0.0, 0.0],
+            [-1.0, -1.0],
+            [np.sin(np.pi / 10), np.sin(np.pi / 2)]
+        ])
+
+        self.random_cam_pos = np.random.rand(50, 3)
+        self.random_cam_pos = (cam_bounds[:, 1] - cam_bounds[:, 0]) * self.random_cam_pos + cam_bounds[:, 0]
+        self.random_cam_pos *= base_cam_dist / np.linalg.norm(self.random_cam_pos, axis=1, keepdims=True)
+        self.random_cam_pos += np.array([0.5, 0, 0])
+
+
         # Add RGB-D camera (mimic RealSense D415)
         self.camera_params = {
             # large camera, image_size = (240 * 4, 320 * 4)
@@ -92,11 +116,21 @@ class PybulletSim:
             ),
         }
 
-
         self._heightmap_pixel_size = heightmap_pixel_size
         self._heightmap_size = np.round(
             ((self._view_bounds[1][1] - self._view_bounds[1][0]) / self._heightmap_pixel_size,
              (self._view_bounds[0][1] - self._view_bounds[0][0]) / self._heightmap_pixel_size)).astype(int)
+
+    def get_extra_view_parameters(self):
+
+        idx = np.random.choice(self.random_cam_pos.shape[0], size=4)
+
+        return {
+            i: self._get_camera_param(
+                    camera_position=cp,
+                    camera_image_size=[240, 320]
+                ) for i, cp in enumerate(self.random_cam_pos[idx, :])
+        }
 
 
     def _get_camera_param(self, camera_position, camera_image_size):

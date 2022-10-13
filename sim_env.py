@@ -189,14 +189,32 @@ class SimulationEnv():
         color_image1, depth_image1 = self.sim.get_camera_data(self.sim.camera_params[1])
         color_image2, depth_image2 = self.sim.get_camera_data(self.sim.camera_params[2])
 
+        # Generate color and depth images from extra views
+        extra_color_images = []
+        extra_depth_image = []
+        extra_camera_params = list(self.sim.get_extra_view_parameters().values())
+        for cam_par in extra_camera_params:
+            cim, dim = self.sim.get_camera_data(cam_par)
+            extra_color_images.append(cim)
+            extra_depth_image.append(dim)
+
+        extra_color_images = np.stack(extra_color_images)
+        extra_depth_image = np.stack(extra_depth_image)
+
+        # Concatenate the color and depth images
+        extra_color_images = np.concatenate([color_image1[None, ...], extra_color_images], axis=0)
+        extra_depth_image = np.concatenate([depth_image1[None, ...], extra_depth_image], axis=0)
+        extra_camera_params.insert(0, self.sim.camera_params[1])
+
         color_heightmap, depth_heightmap = self.sim.get_heightmap(color_image2, depth_image2, self.sim.camera_params[2])
 
         self.current_depth_heightmap = depth_heightmap
         self.current_color_heightmap = color_heightmap
         self.current_depth_image0 = depth_image0
         self.current_color_image0 = color_image0
-        self.current_depth_image1 = depth_image1
-        self.current_color_image1 = color_image1
+        self.current_depth_image1 = extra_depth_image
+        self.current_color_image1 = extra_color_images
+        self.current_camera_params1 = extra_camera_params
 
     def _random_drop(self, object_num, object_type):
         large_object_id = np.random.choice(object_num)
@@ -501,6 +519,7 @@ class SimulationEnv():
             'depth_image': self.current_depth_image0,
             'color_image_small': self.current_color_image1,
             'depth_image_small': self.current_depth_image1,
+            'camera_params_small': self.current_camera_params1,
             'positions': np.array(positions),
             'orientations': np.array(orientations)
         }

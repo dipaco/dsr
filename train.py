@@ -1,5 +1,7 @@
 import os.path as osp
+import os
 import torch
+import random
 from torch import nn
 import torch.multiprocessing as mp
 import torch.distributed as dist
@@ -9,7 +11,8 @@ import argparse
 import itertools
 import shutil
 from tqdm import tqdm
-from data import Data
+from data import Data, ParabolicShotData
+from data_shapestacks import ShapestacksDataset
 from utils import mkdir, flow2im, html_visualize, mask_visualization, tsdf_visualization
 from model import ModelDSR
 
@@ -17,10 +20,12 @@ parser = argparse.ArgumentParser()
 
 # exp args
 parser.add_argument('--exp', type=str, help='name of exp')
+parser.add_argument('--log_dir', type=str, help='log dir.')
 parser.add_argument('--gpus', type=int, nargs='+', help='list of gpus to be used, separated by space')
 parser.add_argument('--resume', default=None, type=str, help='path to model or exp, None means training from scratch')
 
 # data args
+parser.add_argument('--dataset', type=str, help='Dataset type', choices=['dsr', 'throwing', 'shapestacks'], default='dsr')
 parser.add_argument('--data_path', type=str, help='path to data')
 parser.add_argument('--object_num', type=int, default=5, help='number of objects')
 parser.add_argument('--seq_len', type=int, default=10, help='sequence length for training')
@@ -29,6 +34,8 @@ parser.add_argument('--workers', type=int, default=4, help='number of workers pe
 
 parser.add_argument('--model_type', type=str, default='dsr', choices=['dsr', 'single', 'nowarp', 'gtwarp', '3dflow'])
 parser.add_argument('--transform_type', type=str, default='se3euler', choices=['affine', 'se3euler', 'se3aa', 'se3spquat', 'se3quat'])
+parser.add_argument('--use_velocity_action', action='store_true', default=False)
+parser.add_argument('--mask_out_bg', action='store_true', default=False)
 
 # loss args
 parser.add_argument('--alpha_motion', type=float, default=1.0, help='weight of motino loss (MSE)')
@@ -43,7 +50,72 @@ parser.add_argument('--finetune', dest='finetune', action='store_true',
 # distributed training args
 parser.add_argument('--seed', type=int, default=23333, help='random seed')
 parser.add_argument('--dist_backend', type=str, default='nccl', help='distributed training backend')
-parser.add_argument('--dist_url', type=str, default='tcp://127.0.0.1:2333', help='distributed training url')
+
+# Initializa multi training server
+os.environ['MASTER_ADDR'] = 'localhost'
+# set a random port to be able to launch several jobs in a single machine
+#os.environ['MASTER_PORT'] = str(2 ** 15 + 2 ** 14 + hash(os.getuid()) % 2 ** 14)
+#port = 2 ** 15 + 2 ** 14 + hash(os.getuid()) % 2 ** 14
+BASE_PORT = 49751
+port = BASE_PORT + random.randint(1, 10000)
+#dist_url = f"tcp://127.0.0.1:{port}"
+
+# initialize the process group
+#dist.init_process_group("nccl", rank=rank, world_size=world_size, init_method=dist_url)
+
+parser.add_argument('--dist_url', type=str, default=f'tcp://127.0.0.1:{port}', help='distributed training url')
+
+import re
+from torch._six import container_abcs, string_classes, int_classes
+np_str_obj_array_pattern = re.compile(r'[SaUO]')
+def default_collate(batch):
+    r"""Puts each data field into a tensor with outer dimension batch size"""
+
+    elem = batch[0]
+    elem_type = type(elem)
+    if isinstance(elem, torch.Tensor):
+        out = None
+        if torch.utils.data.get_worker_info() is not None:
+            # If we're in a background process, concatenate directly into a
+            # shared memory tensor to avoid an extra copy
+            numel = sum([x.numel() for x in batch])
+            storage = elem.storage()._new_shared(numel)
+            out = elem.new(storage)
+        return torch.stack(batch, 0, out=out)
+    elif elem_type.__module__ == 'numpy' and elem_type.__name__ != 'str_' \
+            and elem_type.__name__ != 'string_':
+        elem = batch[0]
+        if elem_type.__name__ == 'ndarray':
+            # array of string classes and object
+            if np_str_obj_array_pattern.search(elem.dtype.str) is not None:
+                raise TypeError(default_collate_err_msg_format.format(elem.dtype))
+
+            return default_collate([torch.as_tensor(b) for b in batch])
+        elif elem.shape == ():  # scalars
+            return torch.as_tensor(batch)
+    elif isinstance(elem, float):
+        return torch.tensor(batch, dtype=torch.float64)
+    elif isinstance(elem, int_classes):
+        return torch.tensor(batch)
+    elif isinstance(elem, string_classes):
+        return batch
+    elif isinstance(elem, container_abcs.Mapping):
+        #import pdb
+        #pdb.set_trace()
+        out_dict = {key: default_collate([d[key] for d in batch]) for key in elem if (key != 'faces' and not key.endswith('verts'))}
+        out_dict['faces'] = [d['faces'] for d in batch]
+
+        nn = len([aa for aa in elem.keys() if aa.endswith('verts')])
+        for ii in range(nn):
+            out_dict[f'{ii}-verts'] = [d[f'{ii}-verts'] for d in batch]
+        return out_dict
+    elif isinstance(elem, tuple) and hasattr(elem, '_fields'):  # namedtuple
+        return elem_type(*(default_collate(samples) for samples in zip(*batch)))
+    elif isinstance(elem, container_abcs.Sequence):
+        transposed = zip(*batch)
+        return [default_collate(samples) for samples in transposed]
+
+    raise TypeError(default_collate_err_msg_format.format(elem_type))
 
 
 def main():
@@ -64,10 +136,10 @@ def main():
 
     # resume
     if args.resume is not None and not args.resume.endswith('.pth'):
-        args.resume = osp.join('exp', args.resume, 'models/latest.pth')
+        args.resume = osp.join(args.log_dir, args.resume, 'models/latest.pth')
 
     # dir & args
-    exp_dir = osp.join('exp', args.exp)
+    exp_dir = osp.join(args.log_dir, args.exp)
     mkdir(exp_dir)
 
     print('==> arguments parsed')
@@ -81,13 +153,17 @@ def main():
     args.visualization_dir = osp.join(exp_dir, 'visualization')
     mkdir(args.visualization_dir)
 
-    mp.spawn(main_worker, nprocs=len(args.gpus), args=(len(args.gpus), args))
+    num_gpus = len(args.gpus)
+    if num_gpus > 1:
+        mp.spawn(main_worker, nprocs=num_gpus, args=(num_gpus, args))
+    else:
+        main_worker(0, num_gpus, args)
 
 
 def main_worker(rank, world_size, args):
     args.gpu = args.gpus[rank]
     if rank == 0:
-        writer = SummaryWriter(osp.join('exp', args.exp))
+        writer = SummaryWriter(osp.join(args.log_dir, args.exp))
     print(f'==> Rank={rank}, Use GPU: {args.gpu} for training.')
     dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=world_size, rank=rank)
 
@@ -97,6 +173,7 @@ def main_worker(rank, world_size, args):
         object_num=args.object_num,
         transform_type=args.transform_type,
         motion_type='se3' if args.model_type != '3dflow' else 'conv',
+        arch_type=args.dataset,
     )
 
     model.cuda()
@@ -109,14 +186,22 @@ def main_worker(rank, world_size, args):
 
     data, samplers, loaders = {}, {}, {}
     for split in ['train', 'test']:
-        data[split] = Data(data_path=args.data_path, split=split, seq_len=args.seq_len)
+
+        if args.dataset == 'dsr':
+            data[split] = Data(data_path=args.data_path, split=split, seq_len=args.seq_len)
+        elif args.dataset == 'shapestacks':
+            data[split] = ShapestacksDataset(base_path=args.data_path, split=split, num_objects=args.object_num-1, sequence_length=args.seq_len, use_velocity_action=args.use_velocity_action)
+        else:
+            data[split] = ParabolicShotData(data_path=args.data_path, split=split, seq_len=args.seq_len, use_velocity_action=args.use_velocity_action, mask_out_bg=args.mask_out_bg)
+
         samplers[split] = torch.utils.data.distributed.DistributedSampler(data[split])
         loaders[split] = DataLoader(
             dataset=data[split],
             batch_size=args.batch,
             num_workers=args.workers,
             sampler=samplers[split],
-            pin_memory=False
+            pin_memory=False,
+            collate_fn=default_collate,
         )
     print('==> dataset loaded: [size] = {0} + {1}'.format(len(data['train']), len(data['test'])))
 

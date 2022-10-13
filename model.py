@@ -81,8 +81,9 @@ class FeatureDecoder(nn.Module):
 
 
 class MotionDecoder(nn.Module):
-    def __init__(self):
+    def __init__(self, volume_size):
         super().__init__()
+        self.volume_size = volume_size
         self.conv3d00 = ConvBlock3D(8 + 8, 8, stride=2, dilation=1, norm=True, relu=True)  # 64
 
         self.conv3d10 = ConvBlock3D(8 + 8, 16, stride=2, dilation=1, norm=True, relu=True)  # 32
@@ -111,7 +112,7 @@ class MotionDecoder(nn.Module):
         # feature: [B, 8, 128, 128, 48]
         # action:  [B, 8,  128, 128]
 
-        action_embedding0 = torch.unsqueeze(action, -1).expand([-1, -1, -1, -1, 48])
+        action_embedding0 = torch.unsqueeze(action, -1).expand([-1, -1, -1, -1, self.volume_size[-1]])
         feature0 = self.conv3d00(torch.cat([feature, action_embedding0], dim=1))
 
         action1 = self.conv2d10(action)
@@ -120,7 +121,7 @@ class MotionDecoder(nn.Module):
         action1 = self.conv2d13(action1)
 
         action_embedding1 = self.conv2d14(action1)
-        action_embedding1 = torch.unsqueeze(action_embedding1, -1).expand([-1, -1, -1, -1, 24])
+        action_embedding1 = torch.unsqueeze(action_embedding1, -1).expand([-1, -1, -1, -1, self.volume_size[-1] // 2])
         feature1 = self.conv3d10(torch.cat([feature0, action_embedding1], dim=1))
 
         action2 = self.conv2d20(action1)
@@ -129,7 +130,7 @@ class MotionDecoder(nn.Module):
         action2 = self.conv2d23(action2)
 
         action_embedding2 = self.conv2d24(action2)
-        action_embedding2 = torch.unsqueeze(action_embedding2, -1).expand([-1, -1, -1, -1, 12])
+        action_embedding2 = torch.unsqueeze(action_embedding2, -1).expand([-1, -1, -1, -1, self.volume_size[-1] // 4])
         feature2 = self.conv3d20(torch.cat([feature1, action_embedding2], dim=1))
 
         feature3 = self.conv3d30(feature2)
@@ -152,7 +153,7 @@ class MaskDecoder(nn.Module):
 
 
 class TransformDecoder(nn.Module):
-    def __init__(self, transform_type, object_num):
+    def __init__(self, transform_type, object_num, volume_size):
         super().__init__()
         num_params_dict = {
             'affine': 12,
@@ -163,6 +164,7 @@ class TransformDecoder(nn.Module):
         }
         self.num_params = num_params_dict[transform_type]
         self.object_num = object_num
+        self.volume_size = volume_size
 
         self.conv3d00 = ConvBlock3D(8 + 8, 8, stride=2, dilation=1, norm=True, relu=True)  # 64
 
@@ -177,8 +179,10 @@ class TransformDecoder(nn.Module):
 
         self.conv3d40 = ConvBlock3D(128, 128, stride=2, dilation=1, norm=True, relu=True)  # 4
 
-        self.conv3d50 = nn.Conv3d(128, 128, kernel_size=(4, 4, 2))
-
+        if self.volume_size[-1] in [48, 64]:
+            self.conv3d50 = nn.Conv3d(128, 128, kernel_size=(4, 4, 2))
+        else:
+            self.conv3d50 = nn.Conv3d(128, 128, kernel_size=(4, 4, 4))
 
         self.conv2d10 = ConvBlock2D(8, 64, stride=2, norm=True, relu=True)  # 64
         self.conv2d11 = ConvBlock2D(64, 64, stride=1, dilation=1, norm=True, relu=True)
@@ -204,7 +208,7 @@ class TransformDecoder(nn.Module):
         # feature: [B, 8, 128, 128, 48]
         # action:  [B, 8,  128, 128]
 
-        action_embedding0 = torch.unsqueeze(action, -1).expand([-1, -1, -1, -1, 48])
+        action_embedding0 = torch.unsqueeze(action, -1).expand([-1, -1, -1, -1, self.volume_size[-1]])
         feature0 = self.conv3d00(torch.cat([feature, action_embedding0], dim=1))
 
         action1 = self.conv2d10(action)
@@ -213,7 +217,7 @@ class TransformDecoder(nn.Module):
         action1 = self.conv2d13(action1)
 
         action_embedding1 = self.conv2d14(action1)
-        action_embedding1 = torch.unsqueeze(action_embedding1, -1).expand([-1, -1, -1, -1, 24])
+        action_embedding1 = torch.unsqueeze(action_embedding1, -1).expand([-1, -1, -1, -1, self.volume_size[-1] // 2])
         feature1 = self.conv3d10(torch.cat([feature0, action_embedding1], dim=1))
 
         action2 = self.conv2d20(action1)
@@ -222,7 +226,7 @@ class TransformDecoder(nn.Module):
         action2 = self.conv2d23(action2)
 
         action_embedding2 = self.conv2d24(action2)
-        action_embedding2 = torch.unsqueeze(action_embedding2, -1).expand([-1, -1, -1, -1, 12])
+        action_embedding2 = torch.unsqueeze(action_embedding2, -1).expand([-1, -1, -1, -1, self.volume_size[-1] // 4])
         feature2 = self.conv3d20(torch.cat([feature1, action_embedding2], dim=1))
         feature2 = self.conv3d21(feature2)
         feature2 = self.conv3d22(feature2)
@@ -239,15 +243,17 @@ class TransformDecoder(nn.Module):
 
 
 class ModelDSR(nn.Module):
-    def __init__(self, object_num=5, transform_type='se3euler', motion_type='se3'):
+    def __init__(self, object_num=5, transform_type='se3euler', motion_type='se3', arch_type='dsr'):
         # transform_type options:   None, 'affine', 'se3euler', 'se3aa', 'se3quat', 'se3spquat'
         # motion_type options:      'se3', 'conv'
-        # input volume size:        [128, 128, 48]
+        # input volume size:        [128, 128, 48] if arch_type == 'dsr' else if arch_type == 'throwing' [128, 128, 64]
 
         super().__init__()
         self.transform_type = transform_type
         self.K = object_num
         self.motion_type = motion_type
+        self.volume_size = [128, 128, 48] if arch_type == 'dsr' else [128, 128, 64]
+        self.volume_size = torch.tensor(self.volume_size)
 
         # modules
         self.forward_warp = Forward_Warp_Cupy.apply
@@ -257,11 +263,12 @@ class ModelDSR(nn.Module):
             self.mask_decoder = MaskDecoder(self.K)
             self.transform_decoder = TransformDecoder(
                 transform_type=self.transform_type,
-                object_num=self.K - 1
+                object_num=self.K - 1,
+                volume_size=self.volume_size,
             )
             self.se3 = SE3(self.transform_type)
         elif self.motion_type == 'conv':
-            self.motion_decoder = MotionDecoder()
+            self.motion_decoder = MotionDecoder(self.volume_size)
         else:
             raise ValueError('motion_type doesn\'t support ', self.motion_type)
 
@@ -275,12 +282,12 @@ class ModelDSR(nn.Module):
 
         # const value
         self.grids = torch.stack(torch.meshgrid(
-            torch.linspace(0, 127, 128),
-            torch.linspace(0, 127, 128),
-            torch.linspace(0, 47, 48)
+            torch.linspace(0, self.volume_size[0] - 1, self.volume_size[0]),
+            torch.linspace(0, self.volume_size[1] - 1, self.volume_size[1]),
+            torch.linspace(0, self.volume_size[2] - 1, self.volume_size[2])
         ))
-        self.coord_feature = self.grids / torch.tensor([128, 128, 48]).view([3, 1, 1, 1])
-        self.grids_flat = self.grids.view(1, 1, 3, 128 * 128 * 48)
+        self.coord_feature = self.grids / self.volume_size.view([3, 1, 1, 1])
+        self.grids_flat = self.grids.view(1, 1, 3, self.volume_size.prod().item())
         self.zero_vec = torch.zeros([1, 1, 3], dtype=torch.float)
         self.eye_mat = torch.eye(3, dtype=torch.float)
 
@@ -301,7 +308,6 @@ class ModelDSR(nn.Module):
             output['motion'] = motion
 
             return output
-
 
         assert(self.motion_type == 'se3')
         logit, mask = self.mask_decoder(mask_feature)
@@ -359,7 +365,7 @@ class ModelDSR(nn.Module):
 
 
     def get_init_repr(self, batch_size):
-        return torch.zeros([batch_size, 8, 128, 128, 48], dtype=torch.float)
+        return torch.zeros([batch_size, 8, self.volume_size[0], self.volume_size[1], self.volume_size[2]], dtype=torch.float)
 
 
 if __name__=='__main__':

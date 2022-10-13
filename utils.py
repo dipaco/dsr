@@ -140,7 +140,7 @@ def mkdir(path, clean=False):
     if clean and os.path.exists(path):
         shutil.rmtree(path)
     if not os.path.exists(path):
-        os.makedirs(path)
+        os.makedirs(path, exist_ok=True)
 
 
 def imresize(im, dsize, cfirst=False):
